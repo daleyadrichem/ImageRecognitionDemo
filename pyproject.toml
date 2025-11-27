@@ -1,0 +1,24 @@
+[project]
+name = "ai-vision-demo"
+version = "0.1.0"
+description = "Live AI demo: classification, detection, segmentation, and style transfer"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    # Core ML stack
+    "torch==2.2.2",
+    "torchvision==0.17.2",
+
+    # Vision + utilities
+    "opencv-python==4.9.0.80",
+    "pillow==10.3.0",
+    "numpy==1.26.4",
+]
+
+[tool.uv]
+# Tells uv to use the local virtual environment directory
+venv = ".venv"
+
+# Optional: if you want reproducibility
+package = true
