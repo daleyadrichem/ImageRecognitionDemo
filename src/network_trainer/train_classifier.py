@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet18, ResNet18_Weights
 from PIL import Image
 from pycocotools.coco import COCO
 from tqdm import tqdm
@@ -25,11 +25,32 @@ class CocoCropClassificationDataset(Dataset):
     Each bounding box becomes one training example.
     """
 
-    def __init__(self, image_dir, ann_file, transforms=None):
+    def __init__(self, image_dir, ann_file, classes_file, transforms=None):
         self.coco = COCO(ann_file)
         self.image_dir = Path(image_dir)
         self.transforms = transforms
 
+        # ------------------------------------------------
+        # Load allowed classes explicitly
+        # ------------------------------------------------
+        with open(classes_file) as f:
+            self.class_names = [c.strip() for c in f if c.strip()]
+
+        self.class_to_idx = {
+            name: i for i, name in enumerate(self.class_names)
+        }
+
+        self.idx_to_class = {
+            i: name for name, i in self.class_to_idx.items()
+        }
+
+        print(f"Using {len(self.class_names)} classes:")
+        for c in self.class_names:
+            print(" ", c)
+
+        # ------------------------------------------------
+        # Build samples
+        # ------------------------------------------------
         self.samples = []
 
         for img_id in self.coco.imgs:
@@ -40,24 +61,26 @@ class CocoCropClassificationDataset(Dataset):
                 if ann.get("iscrowd", 0):
                     continue
 
+                cat = self.coco.loadCats(ann["category_id"])[0]["name"]
+
+                if cat not in self.class_to_idx:
+                    continue
+
                 self.samples.append(
                     (
                         img_id,
-                        ann["bbox"],          # x,y,w,h
-                        ann["category_id"],   # label
+                        ann["bbox"],              # x,y,w,h
+                        self.class_to_idx[cat],   # remapped label
                     )
                 )
 
-        self.cat_ids = sorted(self.coco.getCatIds())
-        self.cat_id_to_idx = {
-            cat_id: i for i, cat_id in enumerate(self.cat_ids)
-        }
+        print(f"Total classification samples: {len(self.samples)}")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_id, bbox, cat_id = self.samples[idx]
+        img_id, bbox, label = self.samples[idx]
 
         img_info = self.coco.loadImgs(img_id)[0]
         img_path = self.image_dir / img_info["file_name"]
@@ -70,9 +93,8 @@ class CocoCropClassificationDataset(Dataset):
         if self.transforms:
             crop = self.transforms(crop)
 
-        label = self.cat_id_to_idx[cat_id]
-
         return crop, label
+
 
 
 # ---------------------------------------------------------
@@ -112,39 +134,31 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    weights = ResNet18_Weights.IMAGENET1K_V1
+
     train_tf = transforms.Compose(
         [
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=ResNet50_Weights.IMAGENET1K_V1.meta["mean"],
-                std=ResNet50_Weights.IMAGENET1K_V1.meta["std"],
-            ),
+            weights.transforms(),
         ]
     )
 
-    val_tf = transforms.Compose(
-        [
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=ResNet50_Weights.IMAGENET1K_V1.meta["mean"],
-                std=ResNet50_Weights.IMAGENET1K_V1.meta["std"],
-            ),
-        ]
-    )
+    val_tf = weights.transforms()
+
 
     train_ds = CocoCropClassificationDataset(
         image_dir=os.path.join(args.data, "images/train"),
         ann_file=os.path.join(args.data, "annotations/instances_train.json"),
+        classes_file=os.path.join(args.data, "classes.txt"),
         transforms=train_tf,
     )
 
     val_ds = CocoCropClassificationDataset(
         image_dir=os.path.join(args.data, "images/val"),
         ann_file=os.path.join(args.data, "annotations/instances_val.json"),
+        classes_file=os.path.join(args.data, "classes.txt"),
         transforms=val_tf,
     )
 
@@ -162,9 +176,9 @@ def main(args):
         num_workers=4,
     )
 
-    num_classes = len(train_ds.cat_ids)
+    num_classes = len(train_ds.class_names)
 
-    model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     model.to(device)
 
@@ -188,9 +202,10 @@ def main(args):
     torch.save(
         {
             "model": model.state_dict(),
-            "cat_id_to_idx": train_ds.cat_id_to_idx,
+            "classes": train_ds.class_names,
+            "class_to_ idx": train_ds.class_to_idx
         },
-        "resnet50_openimages_animals.pth",
+        f"resnet18_openimages_animals.pth",
     )
 
     print("Model saved.")

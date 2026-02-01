@@ -209,3 +209,6 @@ __marimo__/
 # Video and audio files
 *.mp4
 *.mp3
+
+# Training folder
+openimages_animals/*

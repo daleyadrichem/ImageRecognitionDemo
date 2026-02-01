@@ -10,14 +10,14 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    "torch==2.2.2",
-    "torchvision==0.17.2",
-    "opencv-python==4.9.0.80",
-    "pillow==10.3.0",
-    "numpy==1.26.4",
-    "fiftyone>=1.11.1",
-    "pycocotools>=2.0.11",
-    "tqdm>=4.67.2",
+    "torch",
+    "torchvision",
+    "opencv-python",
+    "pillow",
+    "numpy",
+    "fiftyone",
+    "pycocotools",
+    "tqdm",
 ]
 
 

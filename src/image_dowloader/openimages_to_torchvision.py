@@ -1,107 +1,189 @@
+#!/usr/bin/env python3
 """
-Open Images V7 → Torchvision COCO exporter
+Download selected Open Images V7 classes via FiftyOne
+and export them into a torchvision-compatible COCO layout.
 
-- Optional limits on sample counts
-- Optional class filtering
-- Unlimited download if limits are not provided
+Final structure:
 
-Note:
-Raw data is cached in ~/fiftyone (normal behavior).
+openimages_animals/
+├── images/
+│   ├── train/
+│   └── val/
+├── annotations/
+│   ├── instances_train.json
+│   └── instances_val.json
+└── classes.txt
 """
 
 import argparse
+import shutil
 from pathlib import Path
+
 import fiftyone as fo
 import fiftyone.zoo as foz
+from fiftyone.utils.openimages import get_classes
 
 
-# -------------------------------------------------
-# Default animal classes
-# -------------------------------------------------
+# -------------------------------
+# Validate Open Images classes
+# -------------------------------
 
-DEFAULT_CLASSES = [
-    "Cat",
-    "Dog",
-    "Horse",
-    "Elephant",
-    "Lion",
-    "Tiger",
-    "Bear",
-    "Zebra",
-    "Giraffe",
-    "Monkey",
-    "Kangaroo",
-    "Panda",
-]
+def validate_openimages_classes(requested_classes):
+    available = sorted(get_classes())
+    available_set = set(available)
+
+    valid = []
+    invalid = []
+
+    for cls in requested_classes:
+        if cls in available_set:
+            valid.append(cls)
+        else:
+            invalid.append(cls)
+
+    if invalid:
+        print("\n⚠️ Invalid Open Images classes:\n")
+        for c in invalid:
+            print(f"  {c}")
+
+        print("\nAvailable classes include:\n")
+        for c in available[:40]:
+            print(f"  {c}")
+
+        answer = input(
+            "\nDo you want to continue without the invalid classes? [y/N]: "
+        ).strip().lower()
+
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            exit(1)
+
+    if not valid:
+        raise ValueError("No valid Open Images classes selected")
+
+    print("\n✓ Using classes:")
+    for c in valid:
+        print(f"  {c}")
+    print()
+
+    return valid
 
 
-# -------------------------------------------------
-# Argument parsing
-# -------------------------------------------------
+# ---------------------------------
+# Convert FiftyOne export layout
+# ---------------------------------
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Download Open Images V7 and export to torchvision COCO format"
+def convert_fiftyone_export_to_torchvision(output_dir: Path):
+    train_dir = output_dir / "train"
+    val_dir = output_dir / "val"
+
+    images_train = output_dir / "images" / "train"
+    images_val = output_dir / "images" / "val"
+    ann_dir = output_dir / "annotations"
+
+    images_train.mkdir(parents=True, exist_ok=True)
+    images_val.mkdir(parents=True, exist_ok=True)
+    ann_dir.mkdir(parents=True, exist_ok=True)
+
+    print("📦 Moving images and annotations...")
+
+    shutil.move(str(train_dir / "data"), str(images_train))
+    shutil.move(str(val_dir / "data"), str(images_val))
+
+    shutil.move(
+        str(train_dir / "labels.json"),
+        str(ann_dir / "instances_train.json"),
     )
+
+    shutil.move(
+        str(val_dir / "labels.json"),
+        str(ann_dir / "instances_val.json"),
+    )
+
+    shutil.rmtree(train_dir)
+    shutil.rmtree(val_dir)
+
+    print("✅ Torchvision dataset ready\n")
+
+def flatten_image_dirs(output_dir: Path):
+    """
+    Moves images from images/*/data into images/*/
+    and removes the data directories.
+    """
+
+    for split in ["train", "val"]:
+        split_dir = output_dir / "images" / split
+        data_dir = split_dir / "data"
+
+        if not data_dir.exists():
+            continue
+
+        print(f"📂 Flattening {split} images...")
+
+        for img in data_dir.iterdir():
+            shutil.move(str(img), str(split_dir / img.name))
+
+        shutil.rmtree(data_dir)
+
+
+# -------------------------------
+# Main
+# -------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--output",
-        type=str,
         required=True,
-        help="Output directory for torchvision dataset",
+        help="Output dataset directory",
+    )
+
+    parser.add_argument(
+        "--classes",
+        nargs="*",
+        default=[],
+        help="Open Images class names",
     )
 
     parser.add_argument(
         "--train-samples",
         type=int,
-        default=None,
-        help="Max number of training samples (default: unlimited)",
+        default=5000,
+        help="Number of training images",
     )
 
     parser.add_argument(
         "--val-samples",
         type=int,
-        default=None,
-        help="Max number of validation samples (default: unlimited)",
+        default=1000,
+        help="Number of validation images",
     )
 
-    parser.add_argument(
-        "--classes",
-        nargs="+",
-        default=None,
-        help="Open Images class names (default: built-in animal list)",
-    )
-
-    return parser.parse_args()
-
-
-# -------------------------------------------------
-# Main
-# -------------------------------------------------
-
-def main():
-    args = parse_args()
-
-    classes = args.classes if args.classes is not None else DEFAULT_CLASSES
+    args = parser.parse_args()
 
     output_dir = Path(args.output).expanduser().resolve()
-    (output_dir / "images").mkdir(parents=True, exist_ok=True)
-    (output_dir / "annotations").mkdir(parents=True, exist_ok=True)
 
-    print(f"\nExport directory:\n  {output_dir}\n")
+    print("\n📁 Export directory resolved to:")
+    print(f"  {output_dir}\n")
+
+    classes = validate_openimages_classes(args.classes)
 
     print("Downloading Open Images V7")
     print(f"Classes: {classes}")
-    print("Train samples:", args.train_samples or "ALL")
-    print("Val samples:", args.val_samples or "ALL")
-    print()
+    print(f"Train samples: {args.train_samples}")
+    print(f"Val samples: {args.val_samples}\n")
+
+    # -----------------------
+    # Load datasets
+    # -----------------------
 
     train_dataset = foz.load_zoo_dataset(
         "open-images-v7",
         split="train",
         label_types=["detections", "segmentations"],
         classes=classes,
-        max_samples=args.train_samples,   # None = unlimited
+        max_samples=args.train_samples,
         shuffle=True,
         dataset_name="openimages_train_tmp",
     )
@@ -111,45 +193,57 @@ def main():
         split="validation",
         label_types=["detections", "segmentations"],
         classes=classes,
-        max_samples=args.val_samples,     # None = unlimited
+        max_samples=args.val_samples,
         shuffle=True,
         dataset_name="openimages_val_tmp",
     )
 
+    # -----------------------
+    # Export
+    # -----------------------
+
     print("Exporting train split...")
+
     train_dataset.export(
-        export_dir=str(output_dir),
+        export_dir=str(output_dir / "train"),
         dataset_type=fo.types.COCODetectionDataset,
-        split="train",
-        label_field="detections",
-        classes=classes,
+        export_media=True,
     )
 
     print("Exporting val split...")
+
     val_dataset.export(
-        export_dir=str(output_dir),
+        export_dir=str(output_dir / "val"),
         dataset_type=fo.types.COCODetectionDataset,
-        split="val",
-        label_field="detections",
-        classes=classes,
+        export_media=True,
     )
 
-    # write class list
-    with open(output_dir / "classes.txt", "w") as f:
-        for cls in classes:
-            f.write(cls + "\n")
+    # -----------------------
+    # Convert layout
+    # -----------------------
 
-    print("\n✅ Finished successfully")
-    print("\nFinal dataset:")
+    convert_fiftyone_export_to_torchvision(output_dir)
+
+    flatten_image_dirs(output_dir)
+
+    # -----------------------
+    # Save classes
+    # -----------------------
+
+    with open(output_dir / "classes.txt", "w") as f:
+        for c in classes:
+            f.write(c + "\n")
+
+    print("Final dataset:")
     print("  images/train/")
     print("  images/val/")
     print("  annotations/instances_train.json")
     print("  annotations/instances_val.json")
-    print("  classes.txt")
+    print("  classes.txt\n")
 
-    print("\nNotes:")
+    print("Notes:")
     print("• Raw Open Images cached in: ~/fiftyone/")
-    print("• Dataset usable directly by torchvision")
+    print("• Dataset usable directly by torchvision\n")
 
 
 if __name__ == "__main__":
