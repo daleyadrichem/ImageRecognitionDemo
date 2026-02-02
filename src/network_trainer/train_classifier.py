@@ -2,12 +2,14 @@ import os
 import json
 import argparse
 from pathlib import Path
+import glob
+import re
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 from PIL import Image
 from pycocotools.coco import COCO
 from tqdm import tqdm
@@ -101,6 +103,25 @@ class CocoCropClassificationDataset(Dataset):
 # Training
 # ---------------------------------------------------------
 
+def find_latest_checkpoint(ckpt_dir, prefix):
+    pattern = re.compile(rf"{prefix}_epoch_(\d+)\.pth")
+    checkpoints = glob.glob(os.path.join(ckpt_dir, f"{prefix}_epoch_*.pth"))
+
+    if not checkpoints:
+        return None, 0
+
+    epochs = []
+    for ckpt in checkpoints:
+        match = pattern.search(os.path.basename(ckpt))
+        if match:
+            epochs.append((int(match.group(1)), ckpt))
+
+    if not epochs:
+        return None, 0
+
+    latest_epoch, latest_ckpt = max(epochs, key=lambda x: x[0])
+    return latest_ckpt, latest_epoch + 1
+
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
@@ -134,7 +155,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    weights = ResNet18_Weights.IMAGENET1K_V1
+    weights = ResNet50_Weights.IMAGENET1K_V1
 
     train_tf = transforms.Compose(
         [
@@ -178,17 +199,35 @@ def main(args):
 
     num_classes = len(train_ds.class_names)
 
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
 
+    start_epoch = 0
+    ckpt_dir = "models/classification"
+    prefix = "resnet50_openimages_animals"
+
+    if not args.rerun:
+        ckpt_path, start_epoch = find_latest_checkpoint(ckpt_dir, prefix)
+
+        if ckpt_path is not None:
+            print(f"Resuming from checkpoint: {ckpt_path}")
+            checkpoint = torch.load(ckpt_path, map_location=device)
+
+            if checkpoint["classes"] != train_ds.class_names:
+                raise ValueError("Class list in checkpoint does not match current dataset")
+
+            model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            start_epoch = checkpoint["epoch"] + 1
+
     print(f"Training classifier on {len(train_ds)} crops")
     print(f"Number of classes: {num_classes}")
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device
         )
@@ -199,13 +238,24 @@ def main(args):
             f"acc={train_acc*100:.2f}%"
         )
 
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "classes": train_ds.class_names,
+                "class_to_idx": train_ds.class_to_idx,
+            },
+            f"{ckpt_dir}/{prefix}_epoch_{epoch:03d}.pth",
+        )
+
     torch.save(
         {
             "model": model.state_dict(),
             "classes": train_ds.class_names,
-            "class_to_ idx": train_ds.class_to_idx
+            "class_to_idx": train_ds.class_to_idx
         },
-        f"resnet18_openimages_animals.pth",
+        f"models/classification/resnet50_openimages_animals.pth",
     )
 
     print("Model saved.")
@@ -221,6 +271,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--rerun", action="store_true", default=False)
 
     args = parser.parse_args()
     main(args)
