@@ -212,3 +212,6 @@ __marimo__/
 
 # Training folder
 openimages_animals/*
+
+# Models 
+*.pth
