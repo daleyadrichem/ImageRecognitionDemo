@@ -209,6 +209,7 @@ def main(args):
     start_epoch = 0
     ckpt_dir = "models/classification"
     prefix = "resnet50_openimages_animals"
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     if not args.rerun:
         ckpt_path, start_epoch = find_latest_checkpoint(ckpt_dir, prefix)
@@ -255,7 +256,7 @@ def main(args):
             "classes": train_ds.class_names,
             "class_to_idx": train_ds.class_to_idx
         },
-        f"models/classification/resnet50_openimages_animals.pth",
+        f"{ckpt_dir}/{prefix}.pth",
     )
 
     print("Model saved.")
