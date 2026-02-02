@@ -1,12 +1,15 @@
 import os
+import argparse
+import glob
+import re
+
 import torch
 import torchvision
 from torchvision.datasets import CocoDetection
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.transforms import functional as F
 from torch.utils.data import DataLoader
-from pycocotools.coco import COCO
-import argparse
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------
@@ -15,10 +18,9 @@ import argparse
 
 class CocoDetectionWrapper(CocoDetection):
     def __getitem__(self, idx):
-        img, target = super().__getitem__(idx)
+        img, anns = super().__getitem__(idx)
 
         image_id = self.ids[idx]
-        anns = target
 
         boxes = []
         labels = []
@@ -67,14 +69,64 @@ def build_model(num_classes):
 
 
 # ---------------------------------------------------------
+# Checkpoint utilities
+# ---------------------------------------------------------
+
+def find_latest_checkpoint(ckpt_dir, prefix):
+    pattern = re.compile(rf"{prefix}_epoch_(\d+)\.pth")
+    checkpoints = glob.glob(os.path.join(ckpt_dir, f"{prefix}_epoch_*.pth"))
+
+    if not checkpoints:
+        return None, 0
+
+    parsed = []
+    for ckpt in checkpoints:
+        m = pattern.search(os.path.basename(ckpt))
+        if m:
+            parsed.append((int(m.group(1)), ckpt))
+
+    if not parsed:
+        return None, 0
+
+    epoch, path = max(parsed, key=lambda x: x[0])
+    return path, epoch + 1
+
+
+# ---------------------------------------------------------
 # Training
 # ---------------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, device):
-    model.train()
-    total_loss = 0
+def train_one_epoch(model, loader, optimizer, device, max_batches=None):
+    """
+    Train the model for one epoch.
 
-    for images, targets in loader:
+    Args:
+        model: Detection model
+        loader: DataLoader
+        optimizer: Optimizer
+        device: Torch device
+        max_batches: Optional limit on number of batches (debug mode)
+
+    Returns:
+        Average loss for the epoch
+    """
+    model.train()
+    total_loss = 0.0
+
+    # Determine how many batches tqdm should expect
+    total = min(len(loader), max_batches) if max_batches else len(loader)
+
+    progress_bar = tqdm(
+        enumerate(loader),
+        total=total,
+        desc="Training",
+        leave=False,
+    )
+
+    for i, (images, targets) in progress_bar:
+        if max_batches is not None and i >= max_batches:
+            break
+
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -85,9 +137,14 @@ def train_one_epoch(model, loader, optimizer, device):
         losses.backward()
         optimizer.step()
 
-        total_loss += losses.item()
+        loss_value = losses.item()
+        total_loss += loss_value
 
-    return total_loss / len(loader)
+        # Update tqdm display
+        progress_bar.set_postfix(loss=f"{loss_value:.4f}")
+
+    return total_loss / (i + 1)
+
 
 
 # ---------------------------------------------------------
@@ -96,6 +153,14 @@ def train_one_epoch(model, loader, optimizer, device):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt_dir = "models/detection"
+    prefix = "fasterrcnn_openimages_animals"
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # -----------------------------------------------------
+    # Datasets
+    # -----------------------------------------------------
 
     train_dataset = CocoDetectionWrapper(
         root=os.path.join(args.data, "images/train"),
@@ -107,7 +172,7 @@ def main(args):
         annFile=os.path.join(args.data, "annotations/instances_val.json"),
     )
 
-    num_classes = len(train_dataset.coco.getCatIds()) + 1
+    num_classes = len(train_dataset.coco.getCatIds()) + 1  # + background
 
     train_loader = DataLoader(
         train_dataset,
@@ -117,16 +182,19 @@ def main(args):
         collate_fn=collate_fn,
     )
 
+    # -----------------------------------------------------
+    # Model
+    # -----------------------------------------------------
+
     model = build_model(num_classes)
     model.to(device)
 
-    # -----------------------------------------
-    # Transfer learning strategy
-    # -----------------------------------------
+    # -----------------------------------------------------
+    # Optimizer setup (initially backbone frozen)
+    # -----------------------------------------------------
 
-    # Freeze backbone for first few epochs
-    for param in model.backbone.parameters():
-        param.requires_grad = False
+    for p in model.backbone.parameters():
+        p.requires_grad = False
 
     optimizer = torch.optim.SGD(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -135,15 +203,60 @@ def main(args):
         weight_decay=1e-4,
     )
 
+    start_epoch = 0
+
+    # -----------------------------------------------------
+    # Resume logic
+    # -----------------------------------------------------
+
+    if not args.rerun:
+        ckpt_path, start_epoch = find_latest_checkpoint(ckpt_dir, prefix)
+
+        if ckpt_path is not None:
+            print(f"Resuming from checkpoint: {ckpt_path}")
+            checkpoint = torch.load(ckpt_path, map_location=device)
+
+            required_keys = {"epoch", "model", "optimizer", "num_classes"}
+            missing = required_keys - checkpoint.keys()
+            if missing:
+                raise KeyError(f"Checkpoint missing keys: {missing}")
+
+            if checkpoint["num_classes"] != num_classes:
+                raise ValueError(
+                    f"Class mismatch: checkpoint={checkpoint['num_classes']} "
+                    f"dataset={num_classes}"
+                )
+
+            model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            start_epoch = checkpoint["epoch"] + 1
+
+    # -----------------------------------------------------
+    # Warmup phase
+    # -----------------------------------------------------
+
     print("Training detection heads only...")
 
-    for epoch in range(args.warmup_epochs):
-        loss = train_one_epoch(model, train_loader, optimizer, device)
+    for epoch in range(start_epoch, min(args.warmup_epochs, args.epochs)):
+        loss = train_one_epoch(model, train_loader, optimizer, device, max_batches=args.max_batches)
         print(f"[Warmup {epoch+1}] loss={loss:.4f}")
 
-    # Unfreeze backbone
-    for param in model.backbone.parameters():
-        param.requires_grad = True
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "num_classes": num_classes,
+            },
+            f"{ckpt_dir}/{prefix}_epoch_{epoch:03d}.pth",
+        )
+
+    # -----------------------------------------------------
+    # Fine-tuning phase
+    # -----------------------------------------------------
+
+    for p in model.backbone.parameters():
+        p.requires_grad = True
 
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -154,11 +267,32 @@ def main(args):
 
     print("Fine-tuning entire network...")
 
-    for epoch in range(args.epochs):
-        loss = train_one_epoch(model, train_loader, optimizer, device)
+    for epoch in range(max(start_epoch, args.warmup_epochs), args.epochs):
+        loss = train_one_epoch(model, train_loader, optimizer, device, max_batches=args.max_batches)
         print(f"[Epoch {epoch+1}] loss={loss:.4f}")
 
-    torch.save(model.state_dict(), "fasterrcnn_openimages_animals.pth")
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "num_classes": num_classes,
+            },
+            f"{ckpt_dir}/{prefix}_epoch_{epoch:03d}.pth",
+        )
+
+    # -----------------------------------------------------
+    # Final model (inference-only)
+    # -----------------------------------------------------
+
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "num_classes": num_classes,
+        },
+        f"{ckpt_dir}/{prefix}.pth",
+    )
+
     print("Model saved.")
 
 
@@ -172,7 +306,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--max-batches", type=int, default=None, help="Limit number of batches per epoch (debug mode)")
     parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--rerun", action="store_true")
 
     args = parser.parse_args()
     main(args)
