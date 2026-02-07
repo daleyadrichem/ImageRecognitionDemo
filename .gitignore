@@ -212,6 +212,9 @@ __marimo__/
 
 # Training folder
 openimages_animals/*
+openimages_animals_yolo/*
 
 # Models 
 *.pth
+runs/*
+models/*
